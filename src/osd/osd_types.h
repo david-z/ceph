@@ -3071,12 +3071,6 @@ struct ObjectContext {
 
   Context *destructor_callback;
 
-private:
-  Mutex lock;
-public:
-  Cond cond;
-  int unstable_writes, readers, writers_waiting, readers_waiting;
-
   /// in-progress copyfrom ops for this object
   bool blocked;
 
@@ -3249,6 +3243,9 @@ public:
   bool get_write(OpRequestRef op) {
     return rwstate.get_write(op, false);
   }
+  bool take_write(OpRequestRef op) {
+    return rwstate.take_write_lock();
+  }
   bool get_excl(OpRequestRef op) {
     return rwstate.get_excl(op);
   }
@@ -3275,6 +3272,9 @@ public:
       rwstate.snaptrimmer_write_marker = true;
       return false;
     }
+  }
+  bool get_read() {
+    return rwstate.get_read_lock();
   }
   bool get_recovery_read() {
     rwstate.recovery_read_marker = true;
@@ -3324,8 +3324,6 @@ public:
   ObjectContext()
     : ssc(NULL),
       destructor_callback(0),
-      lock("ReplicatedPG::ObjectContext::lock"),
-      unstable_writes(0), readers(0), writers_waiting(0), readers_waiting(0),
       blocked(false), requeue_scrub_on_unblock(false) {}
 
   ~ObjectContext() {
@@ -3344,42 +3342,6 @@ public:
   }
   bool is_blocked() const {
     return blocked;
-  }
-
-  // do simple synchronous mutual exclusion, for now.  no waitqueues or anything fancy.
-  void ondisk_write_lock() {
-    lock.Lock();
-    writers_waiting++;
-    while (readers_waiting || readers)
-      cond.Wait(lock);
-    writers_waiting--;
-    unstable_writes++;
-    lock.Unlock();
-  }
-  void ondisk_write_unlock() {
-    lock.Lock();
-    assert(unstable_writes > 0);
-    unstable_writes--;
-    if (!unstable_writes && readers_waiting)
-      cond.Signal();
-    lock.Unlock();
-  }
-  void ondisk_read_lock() {
-    lock.Lock();
-    readers_waiting++;
-    while (unstable_writes)
-      cond.Wait(lock);
-    readers_waiting--;
-    readers++;
-    lock.Unlock();
-  }
-  void ondisk_read_unlock() {
-    lock.Lock();
-    assert(readers > 0);
-    readers--;
-    if (!readers && writers_waiting)
-      cond.Signal();
-    lock.Unlock();
   }
 
   // attr cache
