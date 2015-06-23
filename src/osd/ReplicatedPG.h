@@ -531,7 +531,6 @@ public:
 
     interval_set<uint64_t> modified_ranges;
     ObjectContextRef obc;
-    map<hobject_t,ObjectContextRef> src_obc;
     ObjectContextRef clone_obc;    // if we created a clone
     ObjectContextRef snapset_obc;  // if we created/deleted a snapdir
 
@@ -686,7 +685,6 @@ public:
 
     OpContext *ctx;
     ObjectContextRef obc;
-    map<hobject_t,ObjectContextRef> src_obc;
 
     ceph_tid_t rep_tid;
 
