@@ -432,12 +432,6 @@ int librados::IoCtxImpl::create(const object_t& oid, bool exclusive)
     assert_ver = 0;
     pop = op;
   }
-  while (!assert_src_version.empty()) {
-    map<object_t,uint64_t>::iterator p = assert_src_version.begin();
-    op->assert_src_version(p->first, CEPH_NOSNAP, p->second);
-    assert_src_version.erase(p);
-    pop = op;
-  }
   return pop;
 }
 
@@ -474,18 +468,6 @@ int librados::IoCtxImpl::write_full(const object_t& oid, bufferlist& bl)
   prepare_assert_ops(&op);
   op.write_full(bl);
   return operate(oid, &op, NULL);
-}
-
-int librados::IoCtxImpl::clone_range(const object_t& dst_oid,
-				     uint64_t dst_offset,
-				     const object_t& src_oid,
-				     uint64_t src_offset,
-				     uint64_t len)
-{
-  ::ObjectOperation wr;
-  prepare_assert_ops(&wr);
-  wr.clone_range(src_oid, src_offset, len, dst_offset);
-  return operate(dst_oid, &wr, NULL);
 }
 
 int librados::IoCtxImpl::operate(const object_t& oid, ::ObjectOperation *o,
@@ -1282,11 +1264,6 @@ version_t librados::IoCtxImpl::last_version()
 void librados::IoCtxImpl::set_assert_version(uint64_t ver)
 {
   assert_ver = ver;
-}
-void librados::IoCtxImpl::set_assert_src_version(const object_t& oid,
-						 uint64_t ver)
-{
-  assert_src_version[oid] = ver;
 }
 
 void librados::IoCtxImpl::set_notify_timeout(uint32_t timeout)
