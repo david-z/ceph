@@ -237,52 +237,44 @@ public:
     return found;
   }
 
+private:
+  void _lookup(const K& key, VPtr *val, list<VPtr> *to_release) {
+    ++waiting;
+    while (1) {
+      typename map<K, pair<WeakVPtr, V*> >::iterator i = weak_refs.find(key);
+      if (i != weak_refs.end()) {
+	*val = i->second.first.lock();
+	if (*val) {
+	  lru_add(key, *val, to_release);
+	  --waiting;
+	  return;
+	}
+      } else {
+	*val = VPtr();
+	return;
+      }
+      cond.Wait(lock);
+    }
+  }
+public:
   VPtr lookup(const K& key) {
     VPtr val;
     list<VPtr> to_release;
     {
       Mutex::Locker l(lock);
-      ++waiting;
-      bool retry = false;
-      do {
-	retry = false;
-	typename map<K, pair<WeakVPtr, V*> >::iterator i = weak_refs.find(key);
-	if (i != weak_refs.end()) {
-	  val = i->second.first.lock();
-	  if (val) {
-	    lru_add(key, val, &to_release);
-	  } else {
-	    retry = true;
-	  }
-	}
-	if (retry)
-	  cond.Wait(lock);
-      } while (retry);
-      --waiting;
+      _lookup(key, &val, &to_release);
+      return val;
     }
-    return val;
   }
+
   VPtr lookup_or_create(const K &key) {
     VPtr val;
     list<VPtr> to_release;
     {
       Mutex::Locker l(lock);
-      bool retry = false;
-      do {
-	retry = false;
-	typename map<K, pair<WeakVPtr, V*> >::iterator i = weak_refs.find(key);
-	if (i != weak_refs.end()) {
-	  val = i->second.first.lock();
-	  if (val) {
-	    lru_add(key, val, &to_release);
-	    return val;
-	  } else {
-	    retry = true;
-	  }
-	}
-	if (retry)
-	  cond.Wait(lock);
-      } while (retry);
+      _lookup(key, &val, &to_release);
+      if (val)
+	return val;
 
       V *new_value = new V();
       VPtr new_val(new_value, Cleanup(this, key));
