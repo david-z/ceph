@@ -284,6 +284,24 @@ public:
     }
   }
 
+  template <typename T>
+  VPtr lookup_or_create(const K &key, T arg) {
+    VPtr val;
+    list<VPtr> to_release;
+    {
+      Mutex::Locker l(lock);
+      _lookup(key, &val, &to_release);
+      if (val)
+	return val;
+
+      V *new_value = new V(arg);
+      VPtr new_val(new_value, Cleanup(this, key));
+      weak_refs.insert(make_pair(key, make_pair(new_val, new_value)));
+      lru_add(key, new_val, &to_release);
+      return new_val;
+    }
+  }
+
   /**
    * empty()
    *
