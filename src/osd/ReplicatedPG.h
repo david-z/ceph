@@ -1030,9 +1030,9 @@ protected:
   // projected object info
   SharedLRU<hobject_t, ObjectContext> object_contexts;
   SharedPtrRegistry<hobject_t, RWState> rwstate_registry;
-  // map from oid.snapdir() to SnapSetContext *
-  map<hobject_t, SnapSetContext*> snapset_contexts;
-  Mutex snapset_contexts_lock;
+
+  // map from oid.snapdir() to SnapSetContextRef
+  SharedPtrRegistry<hobject_t, SnapSetContext> snapset_contexts;
 
   // debug order that client ops are applied
   map<hobject_t, map<client_t, ceph_tid_t> > debug_op_order;
@@ -1046,7 +1046,8 @@ public:
   void handle_watch_timeout(WatchRef watch);
 protected:
 
-  ObjectContextRef create_object_context(const object_info_t& oi, SnapSetContext *ssc);
+  ObjectContextRef create_object_context(
+    const object_info_t& oi, SnapSetContextRef ssc);
   ObjectContextRef get_object_context(
     const hobject_t& soid,
     bool can_create,
@@ -1075,25 +1076,11 @@ protected:
 
   void get_src_oloc(const object_t& oid, const object_locator_t& oloc, object_locator_t& src_oloc);
 
-  SnapSetContext *create_snapset_context(const hobject_t& oid);
-  SnapSetContext *get_snapset_context(
+  SnapSetContextRef get_snapset_context(
     const hobject_t& oid,
     bool can_create,
-    map<string, bufferlist> *attrs = 0
+    bufferlist *attr = 0
     );
-  void register_snapset_context(SnapSetContext *ssc) {
-    Mutex::Locker l(snapset_contexts_lock);
-    _register_snapset_context(ssc);
-  }
-  void _register_snapset_context(SnapSetContext *ssc) {
-    assert(snapset_contexts_lock.is_locked());
-    if (!ssc->registered) {
-      assert(snapset_contexts.count(ssc->oid) == 0);
-      ssc->registered = true;
-      snapset_contexts[ssc->oid] = ssc;
-    }
-  }
-  void put_snapset_context(SnapSetContext *ssc);
 
   map<hobject_t, ObjectContextRef> recovering;
 
