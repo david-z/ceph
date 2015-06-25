@@ -1286,7 +1286,7 @@ void ReplicatedPG::do_request(
     return;
 
   switch (op->get_req()->get_type()) {
-  case CEPH_MSG_OSD_OP:
+  case CEPH_MSG_OSD_OP: {
     if (!is_active()) {
       dout(20) << " peered, not active, waiting for active on " << op << dendl;
       waiting_for_active.push_back(op);
@@ -1304,8 +1304,15 @@ void ReplicatedPG::do_request(
       osd->reply_op_error(op, -EOPNOTSUPP);
       return;
     }
+    MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+    if (get_osdmap()->is_blacklisted(m->get_source_addr())) {
+      dout(10) << "do_op " << m->get_source_addr() << " is blacklisted" << dendl;
+      osd->reply_op_error(op, -EBLACKLISTED);
+      return;
+    }
     do_op(op); // do it now
     break;
+  }
 
   case MSG_OSD_SUBOP:
     do_sub_op(op);
@@ -1365,12 +1372,6 @@ void ReplicatedPG::do_op(OpRequestRef& op)
       return;
     }
     return do_pg_op(op);
-  }
-
-  if (get_osdmap()->is_blacklisted(m->get_source_addr())) {
-    dout(10) << "do_op " << m->get_source_addr() << " is blacklisted" << dendl;
-    osd->reply_op_error(op, -EBLACKLISTED);
-    return;
   }
 
   // order this op as a write?
