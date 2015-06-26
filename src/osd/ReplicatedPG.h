@@ -570,7 +570,7 @@ public:
     };
     list<NotifyAck> notify_acks;
     
-    uint64_t bytes_written, bytes_read;
+    uint64_t bytes_written;
 
     utime_t mtime;
     SnapContext snapc;           // writer snap context
@@ -662,7 +662,7 @@ public:
       new_obs(obs->oi, obs->exists),
       modify(false), user_modify(false), undirty(false), cache_evict(false),
       ignore_cache(false), ignore_log_op_stats(false),
-      bytes_written(0), bytes_read(0), user_at_version(0),
+      bytes_written(0), user_at_version(0),
       current_osd_subop_num(0),
       op_t(NULL),
       obc(obc),
@@ -685,7 +685,7 @@ public:
       op(_op), reqid(_reqid), ops(_ops), obs(NULL), snapset(0),
       modify(false), user_modify(false), undirty(false), cache_evict(false),
       ignore_cache(false), ignore_log_op_stats(false),
-      bytes_written(0), bytes_read(0), user_at_version(0),
+      bytes_written(0), user_at_version(0),
       current_osd_subop_num(0),
       op_t(NULL),
       data_off(0), reply(NULL), pg(_pg),
@@ -1268,7 +1268,6 @@ protected:
   void make_writeable(OpContext *ctx);
   void log_op_stats(
     OpRequestRef op,
-    uint64_t inb,
     uint64_t outb,
     utime_t readable_stamp);
 
