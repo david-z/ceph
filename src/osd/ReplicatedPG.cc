@@ -403,7 +403,8 @@ void ReplicatedPG::wait_for_unreadable_object(
     if (is_missing_object(soid)) {
       recover_missing(soid, v, cct->_conf->osd_client_op_priority, h);
     } else {
-      prep_object_replica_pushes(soid, v, h);
+      bool push_started = prep_object_replica_pushes(soid, v, h);
+      assert(push_started); // must have gotten lock
     }
     pgbackend->run_recovery_op(h, cct->_conf->osd_client_op_priority);
   }
@@ -476,7 +477,8 @@ void ReplicatedPG::wait_for_degraded_object(const hobject_t& soid, OpRequestRef 
       }
     }
     PGBackend::RecoveryHandle *h = pgbackend->open_recovery_op();
-    prep_object_replica_pushes(soid, v, h);
+    bool push_started = prep_object_replica_pushes(soid, v, h);
+    assert(push_started); // must have gotten lock
     pgbackend->run_recovery_op(h, cct->_conf->osd_client_op_priority);
   }
   waiting_for_degraded_object[soid].push_back(op);
