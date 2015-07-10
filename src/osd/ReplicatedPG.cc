@@ -1843,6 +1843,12 @@ bool ReplicatedPG::maybe_handle_cache(OpRequestRef op,
 	     << " in_hit_set " << (int)in_hit_set
 	     << dendl;
 
+  // we may need to write to head during promote
+  if (is_degraded_or_backfilling_object(missing_oid.get_head())) {
+    wait_for_degraded_object(missing_oid.get_head(), op);
+    return true;
+  }
+
   // if it is write-ordered and blocked, stop now
   if (obc.get() && obc->is_blocked() && write_ordered) {
     // we're already doing something with this object
