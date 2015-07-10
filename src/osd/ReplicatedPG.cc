@@ -6733,7 +6733,7 @@ void ReplicatedPG::finish_promote(int r, CopyResults *results,
     tctx->lock_to_release = OpContext::W_LOCK;
     dout(20) << __func__ << " took lock on obc, " << *(obc->rwstate) << dendl;
 
-    finish_ctx(tctx, pg_log_entry_t::PROMOTE);
+    finish_ctx(tctx, pg_log_entry_t::MODIFY);
 
     simple_repop_submit(repop);
     return;
