@@ -266,6 +266,52 @@ public:
     return pgbackend.get();
   }
 
+  class C_OSD_CompletedRecoveredObject : public Context {
+    ReplicatedPGRef pg;
+    ObjectContextRef obc;
+    epoch_t epoch;
+
+  public:
+    C_OSD_CompletedRecoveredObject(
+      ReplicatedPGRef pg,
+      ObjectContextRef obc,
+      epoch_t epoch)
+      : pg(pg), obc(obc), epoch(epoch) {}
+
+    void finish(int) {
+      pg->lock();
+      if (pg->pg_has_reset_since(epoch)) {
+	pg->unlock();
+	return;
+      }
+      list<OpRequestRef> to_requeue;
+      obc->drop_recovery_excl_to_read(&to_requeue);
+      pg->requeue_ops(to_requeue);
+      pg->unlock();
+    }
+  };
+  friend class C_OSD_CompletedRecoveredObject;
+
+  class C_OSD_CompletedRecoveredObjectReplica : public Context {
+    ReplicatedPGRef pg;
+    RWStateRef lock;
+
+  public:
+    C_OSD_CompletedRecoveredObjectReplica(
+      ReplicatedPGRef pg,
+      RWStateRef lock)
+      : pg(pg), lock(lock) {}
+
+    void finish(int) {
+      pg->lock();
+      list<OpRequestRef> to_requeue;
+      lock->put_write(&to_requeue);
+      pg->requeue_ops(to_requeue);
+      pg->unlock();
+    }
+  };
+  friend class C_OSD_CompletedRecoveredObjectReplica;
+
   /// Listener methods
   void on_local_recover(
     const hobject_t &oid,

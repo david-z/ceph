@@ -232,7 +232,7 @@ void ReplicatedPG::on_local_recover(
     assert(obc);
     obc->obs.exists = true;
 
-    bool got = obc->get_recovery_read();
+    bool got = obc->try_get_recovery_excl();
     assert(got);
 
     assert(recovering.count(obc->obs.oi.soid));
@@ -241,6 +241,12 @@ void ReplicatedPG::on_local_recover(
 
 
     t->register_on_applied(new C_OSD_AppliedRecoveredObject(this, obc));
+    t->register_on_complete(
+      new C_OSD_CompletedRecoveredObject(
+	this,
+	obc,
+	get_osdmap()->get_epoch()
+	));
 
     publish_stats_to_osd();
     assert(missing_loc.needs_recovery(hoid));
@@ -259,6 +265,13 @@ void ReplicatedPG::on_local_recover(
     t->register_on_applied(
       new C_OSD_AppliedRecoveredObjectReplica(this));
 
+    RWStateRef lock = rwstate_registry.lookup_or_create(hoid);
+    bool got = lock->get_write_lock();
+    assert(got);
+
+    t->register_on_complete(
+      new C_OSD_CompletedRecoveredObjectReplica(
+	this, lock));
   }
 
   t->register_on_commit(
@@ -8787,7 +8800,7 @@ void ReplicatedPG::_clear_recovery_state()
        i != recovering.end();
        recovering.erase(i++)) {
     if (i->second) {
-      i->second->drop_recovery_read(&blocked_ops);
+      i->second->drop_recovery_read_or_excl(&blocked_ops);
       requeue_ops(blocked_ops);
     }
   }

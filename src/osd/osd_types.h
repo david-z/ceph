@@ -3307,6 +3307,19 @@ struct ObjectContext {
     rwstate->put_read(ls);
     rwstate->recovery_read_marker = false;
   }
+  void drop_recovery_read_or_excl(list<OpRequestRef> *ls) {
+    assert(rwstate->recovery_read_marker);
+    switch (rwstate->state) {
+    case RWState::RWREAD:
+      rwstate->put_read(ls);
+      break;
+    case RWState::RWEXCL:
+      rwstate->put_excl(ls);
+      break;
+    default:
+      assert(0 == "Incorect lock type");
+    }
+  }
   void put_read(list<OpRequestRef> *to_wake) {
     rwstate->put_read(to_wake);
   }
