@@ -5259,7 +5259,9 @@ void ReplicatedPG::make_writeable(OpContext *ctx)
     object_info_t static_snap_oi(coid);
     object_info_t *snap_oi;
     if (is_primary()) {
-      ctx->clone_obc = object_contexts.lookup_or_create(static_snap_oi.soid);
+      ctx->clone_obc = object_contexts.lookup_or_create(
+	static_snap_oi.soid,
+	rwstate_registry.lookup_or_create(static_snap_oi.soid));
       ctx->clone_obc->destructor_callback = new C_PG_ObjectContext(this, ctx->clone_obc.get());
       ctx->clone_obc->obs.oi = static_snap_oi;
       ctx->clone_obc->obs.exists = true;
@@ -6474,11 +6476,11 @@ void ReplicatedPG::finish_promote(int r, CopyResults *results,
     tctx->new_snapset.clone_size.erase(soid.snap);
 
     // take RWWRITE lock for duration of our local write.  ignore starvation.
-    if (!obc->rwstate.take_write_lock()) {
+    if (!obc->rwstate->take_write_lock()) {
       assert(0 == "problem!");
     }
     tctx->lock_to_release = OpContext::W_LOCK;
-    dout(20) << __func__ << " took lock on obc, " << obc->rwstate << dendl;
+    dout(20) << __func__ << " took lock on obc, " << *(obc->rwstate) << dendl;
 
     finish_ctx(tctx, pg_log_entry_t::PROMOTE);
 
@@ -6571,11 +6573,11 @@ void ReplicatedPG::finish_promote(int r, CopyResults *results,
   dout(20) << __func__ << " new_snapset " << tctx->new_snapset << dendl;
 
   // take RWWRITE lock for duration of our local write.  ignore starvation.
-  if (!obc->rwstate.take_write_lock()) {
+  if (!obc->rwstate->take_write_lock()) {
     assert(0 == "problem!");
   }
   tctx->lock_to_release = OpContext::W_LOCK;
-  dout(20) << __func__ << " took lock on obc, " << obc->rwstate << dendl;
+  dout(20) << __func__ << " took lock on obc, " << *(obc->rwstate) << dendl;
 
   finish_ctx(tctx, pg_log_entry_t::PROMOTE);
 
@@ -7571,7 +7573,10 @@ void ReplicatedPG::handle_watch_timeout(WatchRef watch)
 ObjectContextRef ReplicatedPG::create_object_context(const object_info_t& oi,
 						     SnapSetContext *ssc)
 {
-  ObjectContextRef obc(object_contexts.lookup_or_create(oi.soid));
+  ObjectContextRef obc(
+    object_contexts.lookup_or_create(
+      oi.soid,
+      rwstate_registry.lookup_or_create(oi.soid)));
   assert(obc->destructor_callback == NULL);
   obc->destructor_callback = new C_PG_ObjectContext(this, obc.get());  
   obc->obs.oi = oi;
@@ -7640,7 +7645,9 @@ ObjectContextRef ReplicatedPG::get_object_context(const hobject_t& soid,
 
     assert(oi.soid.pool == (int64_t)info.pgid.pool());
 
-    obc = object_contexts.lookup_or_create(oi.soid);
+    obc = object_contexts.lookup_or_create(
+      oi.soid,
+      rwstate_registry.lookup_or_create(oi.soid));
     obc->destructor_callback = new C_PG_ObjectContext(this, obc.get());
     obc->obs.oi = oi;
     obc->obs.exists = true;
