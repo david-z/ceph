@@ -2829,6 +2829,17 @@ struct SnapSet {
     return out;
   }
 
+  // resolve snap to a particular clone (or head)
+  snapid_t resolve_snap_to_clone(snapid_t snap) const {
+    for (vector<snapid_t>::const_iterator i = clones.begin();
+	 i != clones.end();
+	 ++i) {
+      if (*i >= snap)
+	return *i;
+    }
+    return CEPH_NOSNAP;
+  }
+
   // return min element of snaps > after, return max if no such element
   snapid_t get_first_snap_after(snapid_t after, snapid_t max) const {
     for (vector<snapid_t>::const_reverse_iterator i = snaps.rbegin();
@@ -3043,15 +3054,178 @@ struct ObjectState {
 
 struct SnapSetContext {
   hobject_t oid;
-  int ref;
-  bool registered;
   SnapSet snapset;
   bool exists;
 
   SnapSetContext(const hobject_t& o) :
-    oid(o), ref(0), registered(false), exists(true) { }
+    oid(o), exists(true) { }
 };
+typedef ceph::shared_ptr<SnapSetContext> SnapSetContextRef;
 
+struct RWState {
+  enum State {
+    RWNONE,
+    RWREAD,
+    RWWRITE,
+    RWEXCL,
+  };
+  static const char *get_state_name(State s) {
+    switch (s) {
+    case RWNONE: return "none";
+    case RWREAD: return "read";
+    case RWWRITE: return "write";
+    case RWEXCL: return "excl";
+    default: return "???";
+    }
+  }
+  const char *get_state_name() const {
+    return get_state_name(state);
+  }
+
+  State state;                 ///< rw state
+  uint64_t count;              ///< number of readers or writers
+  list<OpRequestRef> waiters;  ///< ops waiting on state change
+
+  /// if set, restart backfill when we can get a read lock
+  bool recovery_read_marker;
+
+  /// if set, requeue snaptrim on lock release
+  bool snaptrimmer_write_marker;
+
+  RWState()
+    : state(RWNONE),
+      count(0),
+      recovery_read_marker(false),
+      snaptrimmer_write_marker(false)
+    {}
+  bool get_read(OpRequestRef op) {
+    if (get_read_lock()) {
+      return true;
+    } // else
+    waiters.push_back(op);
+    return false;
+  }
+  /// this function adjusts the counts if necessary
+  bool get_read_lock() {
+    // don't starve anybody!
+    if (!waiters.empty()) {
+      return false;
+    }
+    switch (state) {
+    case RWNONE:
+      assert(count == 0);
+      state = RWREAD;
+      // fall through
+    case RWREAD:
+      count++;
+      return true;
+    case RWWRITE:
+      return false;
+    case RWEXCL:
+      return false;
+    default:
+      assert(0 == "unhandled case");
+      return false;
+    }
+  }
+
+  bool get_write(OpRequestRef op, bool greedy=false) {
+    if (get_write_lock(greedy)) {
+      return true;
+    } // else
+    if (op)
+      waiters.push_back(op);
+    return false;
+  }
+  bool get_write_lock(bool greedy=false) {
+    if (!greedy) {
+      // don't starve anybody!
+      if (!waiters.empty() ||
+	  recovery_read_marker) {
+	return false;
+      }
+    }
+    switch (state) {
+    case RWNONE:
+      assert(count == 0);
+      state = RWWRITE;
+      // fall through
+    case RWWRITE:
+      count++;
+      return true;
+    case RWREAD:
+      return false;
+    case RWEXCL:
+      return false;
+    default:
+      assert(0 == "unhandled case");
+      return false;
+    }
+  }
+  bool get_excl_lock() {
+    switch (state) {
+    case RWNONE:
+      assert(count == 0);
+      state = RWEXCL;
+      count = 1;
+      return true;
+    case RWWRITE:
+      return false;
+    case RWREAD:
+      return false;
+    case RWEXCL:
+      return false;
+    default:
+      assert(0 == "unhandled case");
+      return false;
+    }
+  }
+  bool get_excl(OpRequestRef op) {
+    if (get_excl_lock()) {
+      return true;
+    } // else
+    if (op)
+      waiters.push_back(op);
+    return false;
+  }
+  /// same as get_write_lock, but ignore starvation
+  bool take_write_lock() {
+    if (state == RWWRITE) {
+      count++;
+      return true;
+    }
+    return get_write_lock();
+  }
+  void dec(list<OpRequestRef> *requeue) {
+    assert(count > 0);
+    assert(requeue);
+    count--;
+    if (count == 0) {
+      state = RWNONE;
+      requeue->splice(requeue->end(), waiters);
+    }
+  }
+  void put_read(list<OpRequestRef> *requeue) {
+    assert(state == RWREAD);
+    dec(requeue);
+  }
+  void put_write(list<OpRequestRef> *requeue) {
+    assert(state == RWWRITE);
+    dec(requeue);
+  }
+  void put_excl(list<OpRequestRef> *requeue) {
+    assert(state == RWEXCL);
+    dec(requeue);
+  }
+  void drop_excl_to_read(list<OpRequestRef> *requeue) {
+    assert(state == RWEXCL);
+    assert(count == 1);
+    state = RWREAD;
+    requeue->splice(requeue->end(), waiters);
+  }
+  bool empty() const { return state == RWNONE; }
+};
+typedef ceph::shared_ptr<RWState> RWStateRef;
 
 /*
   * keep tabs on object modifications that are in flight.
@@ -3067,193 +3241,30 @@ typedef ceph::shared_ptr<ObjectContext> ObjectContextRef;
 struct ObjectContext {
   ObjectState obs;
 
-  SnapSetContext *ssc;  // may be null
-
-  Context *destructor_callback;
-
-private:
-  Mutex lock;
-public:
-  Cond cond;
-  int unstable_writes, readers, writers_waiting, readers_waiting;
+  SnapSetContextRef ssc;  // may be null
 
   /// in-progress copyfrom ops for this object
   bool blocked;
 
-  // set if writes for this object are blocked on another objects recovery
-  ObjectContextRef blocked_by;      // object blocking our writes
-  set<ObjectContextRef> blocking;   // objects whose writes we block
   bool requeue_scrub_on_unblock;    // true if we need to requeue scrub on unblock
 
   // any entity in obs.oi.watchers MUST be in either watchers or unconnected_watchers.
   map<pair<uint64_t, entity_name_t>, WatchRef> watchers;
 
-  struct RWState {
-    enum State {
-      RWNONE,
-      RWREAD,
-      RWWRITE,
-      RWEXCL,
-    };
-    static const char *get_state_name(State s) {
-      switch (s) {
-      case RWNONE: return "none";
-      case RWREAD: return "read";
-      case RWWRITE: return "write";
-      case RWEXCL: return "excl";
-      default: return "???";
-      }
-    }
-    const char *get_state_name() const {
-      return get_state_name(state);
-    }
-
-    State state;                 ///< rw state
-    uint64_t count;              ///< number of readers or writers
-    list<OpRequestRef> waiters;  ///< ops waiting on state change
-
-    /// if set, restart backfill when we can get a read lock
-    bool recovery_read_marker;
-
-    /// if set, requeue snaptrim on lock release
-    bool snaptrimmer_write_marker;
-
-    RWState()
-      : state(RWNONE),
-	count(0),
-	recovery_read_marker(false),
-	snaptrimmer_write_marker(false)
-    {}
-    bool get_read(OpRequestRef op) {
-      if (get_read_lock()) {
-	return true;
-      } // else
-      waiters.push_back(op);
-      return false;
-    }
-    /// this function adjusts the counts if necessary
-    bool get_read_lock() {
-      // don't starve anybody!
-      if (!waiters.empty()) {
-	return false;
-      }
-      switch (state) {
-      case RWNONE:
-	assert(count == 0);
-	state = RWREAD;
-	// fall through
-      case RWREAD:
-	count++;
-	return true;
-      case RWWRITE:
-	return false;
-      case RWEXCL:
-	return false;
-      default:
-	assert(0 == "unhandled case");
-	return false;
-      }
-    }
-
-    bool get_write(OpRequestRef op, bool greedy=false) {
-      if (get_write_lock(greedy)) {
-	return true;
-      } // else
-      if (op)
-	waiters.push_back(op);
-      return false;
-    }
-    bool get_write_lock(bool greedy=false) {
-      if (!greedy) {
-	// don't starve anybody!
-	if (!waiters.empty() ||
-	    recovery_read_marker) {
-	  return false;
-	}
-      }
-      switch (state) {
-      case RWNONE:
-	assert(count == 0);
-	state = RWWRITE;
-	// fall through
-      case RWWRITE:
-	count++;
-	return true;
-      case RWREAD:
-	return false;
-      case RWEXCL:
-	return false;
-      default:
-	assert(0 == "unhandled case");
-	return false;
-      }
-    }
-    bool get_excl_lock() {
-      switch (state) {
-      case RWNONE:
-	assert(count == 0);
-	state = RWEXCL;
-	count = 1;
-	return true;
-      case RWWRITE:
-	return false;
-      case RWREAD:
-	return false;
-      case RWEXCL:
-	return false;
-      default:
-	assert(0 == "unhandled case");
-	return false;
-      }
-    }
-    bool get_excl(OpRequestRef op) {
-      if (get_excl_lock()) {
-	return true;
-      } // else
-      if (op)
-	waiters.push_back(op);
-      return false;
-    }
-    /// same as get_write_lock, but ignore starvation
-    bool take_write_lock() {
-      if (state == RWWRITE) {
-	count++;
-	return true;
-      }
-      return get_write_lock();
-    }
-    void dec(list<OpRequestRef> *requeue) {
-      assert(count > 0);
-      assert(requeue);
-      count--;
-      if (count == 0) {
-	state = RWNONE;
-	requeue->splice(requeue->end(), waiters);
-      }
-    }
-    void put_read(list<OpRequestRef> *requeue) {
-      assert(state == RWREAD);
-      dec(requeue);
-    }
-    void put_write(list<OpRequestRef> *requeue) {
-      assert(state == RWWRITE);
-      dec(requeue);
-    }
-    void put_excl(list<OpRequestRef> *requeue) {
-      assert(state == RWEXCL);
-      dec(requeue);
-    }
-    bool empty() const { return state == RWNONE; }
-  } rwstate;
+  // must be valid
+  RWStateRef rwstate;
 
   bool get_read(OpRequestRef op) {
-    return rwstate.get_read(op);
+    return rwstate->get_read(op);
   }
   bool get_write(OpRequestRef op) {
-    return rwstate.get_write(op, false);
+    return rwstate->get_write(op, false);
+  }
+  bool take_write(OpRequestRef op) {
+    return rwstate->take_write_lock();
   }
   bool get_excl(OpRequestRef op) {
-    return rwstate.get_excl(op);
+    return rwstate->get_excl(op);
   }
   bool get_lock_type(OpRequestRef op, RWState::State type) {
     switch (type) {
@@ -3269,72 +3280,93 @@ public:
     }
   }
   bool get_write_greedy(OpRequestRef op) {
-    return rwstate.get_write(op, true);
+    return rwstate->get_write(op, true);
   }
   bool get_snaptrimmer_write() {
-    if (rwstate.get_write_lock()) {
+    if (rwstate->get_write_lock()) {
       return true;
     } else {
-      rwstate.snaptrimmer_write_marker = true;
+      rwstate->snaptrimmer_write_marker = true;
       return false;
     }
   }
+  bool get_read() {
+    return rwstate->get_read_lock();
+  }
   bool get_recovery_read() {
-    rwstate.recovery_read_marker = true;
-    if (rwstate.get_read_lock()) {
+    rwstate->recovery_read_marker = true;
+    if (rwstate->get_read_lock()) {
       return true;
     }
     return false;
   }
+  bool try_get_recovery_excl() {
+    if (rwstate->get_excl_lock()) {
+      rwstate->recovery_read_marker = true;
+      return true;
+    }
+    return false;
+  }
+  void drop_recovery_excl_to_read(list<OpRequestRef> *ls) {
+    rwstate->drop_excl_to_read(ls);
+  }
   void drop_recovery_read(list<OpRequestRef> *ls) {
-    assert(rwstate.recovery_read_marker);
-    rwstate.put_read(ls);
-    rwstate.recovery_read_marker = false;
+    assert(rwstate->recovery_read_marker);
+    rwstate->put_read(ls);
+    rwstate->recovery_read_marker = false;
+  }
+  void drop_recovery_read_or_excl(list<OpRequestRef> *ls) {
+    assert(rwstate->recovery_read_marker);
+    switch (rwstate->state) {
+    case RWState::RWREAD:
+      rwstate->put_read(ls);
+      break;
+    case RWState::RWEXCL:
+      rwstate->put_excl(ls);
+      break;
+    default:
+      assert(0 == "Incorect lock type");
+    }
   }
   void put_read(list<OpRequestRef> *to_wake) {
-    rwstate.put_read(to_wake);
+    rwstate->put_read(to_wake);
   }
   void put_excl(list<OpRequestRef> *to_wake,
 		 bool *requeue_recovery,
 		 bool *requeue_snaptrimmer) {
-    rwstate.put_excl(to_wake);
-    if (rwstate.empty() && rwstate.recovery_read_marker) {
-      rwstate.recovery_read_marker = false;
+    rwstate->put_excl(to_wake);
+    if (rwstate->empty() && rwstate->recovery_read_marker) {
+      rwstate->recovery_read_marker = false;
       *requeue_recovery = true;
     }
-    if (rwstate.empty() && rwstate.snaptrimmer_write_marker) {
-      rwstate.snaptrimmer_write_marker = false;
+    if (rwstate->empty() && rwstate->snaptrimmer_write_marker) {
+      rwstate->snaptrimmer_write_marker = false;
       *requeue_snaptrimmer = true;
     }
   }
   void put_write(list<OpRequestRef> *to_wake,
 		 bool *requeue_recovery,
 		 bool *requeue_snaptrimmer) {
-    rwstate.put_write(to_wake);
-    if (rwstate.empty() && rwstate.recovery_read_marker) {
-      rwstate.recovery_read_marker = false;
+    rwstate->put_write(to_wake);
+    if (rwstate->empty() && rwstate->recovery_read_marker) {
+      rwstate->recovery_read_marker = false;
       *requeue_recovery = true;
     }
-    if (rwstate.empty() && rwstate.snaptrimmer_write_marker) {
-      rwstate.snaptrimmer_write_marker = false;
+    if (rwstate->empty() && rwstate->snaptrimmer_write_marker) {
+      rwstate->snaptrimmer_write_marker = false;
       *requeue_snaptrimmer = true;
     }
   }
   bool is_request_pending() {
-    return (rwstate.count > 0);
+    return (rwstate->count > 0);
   }
 
-  ObjectContext()
-    : ssc(NULL),
-      destructor_callback(0),
-      lock("ReplicatedPG::ObjectContext::lock"),
-      unstable_writes(0), readers(0), writers_waiting(0), readers_waiting(0),
-      blocked(false), requeue_scrub_on_unblock(false) {}
+  ObjectContext(RWStateRef rwstate)
+    : blocked(false), requeue_scrub_on_unblock(false),
+      rwstate(rwstate) {}
 
   ~ObjectContext() {
-    assert(rwstate.empty());
-    if (destructor_callback)
-      destructor_callback->complete(0);
+    assert(rwstate->empty());
   }
 
   void start_block() {
@@ -3347,42 +3379,6 @@ public:
   }
   bool is_blocked() const {
     return blocked;
-  }
-
-  // do simple synchronous mutual exclusion, for now.  no waitqueues or anything fancy.
-  void ondisk_write_lock() {
-    lock.Lock();
-    writers_waiting++;
-    while (readers_waiting || readers)
-      cond.Wait(lock);
-    writers_waiting--;
-    unstable_writes++;
-    lock.Unlock();
-  }
-  void ondisk_write_unlock() {
-    lock.Lock();
-    assert(unstable_writes > 0);
-    unstable_writes--;
-    if (!unstable_writes && readers_waiting)
-      cond.Signal();
-    lock.Unlock();
-  }
-  void ondisk_read_lock() {
-    lock.Lock();
-    readers_waiting++;
-    while (unstable_writes)
-      cond.Wait(lock);
-    readers_waiting--;
-    readers++;
-    lock.Unlock();
-  }
-  void ondisk_read_unlock() {
-    lock.Lock();
-    assert(readers > 0);
-    readers--;
-    if (!readers && writers_waiting)
-      cond.Signal();
-    lock.Unlock();
   }
 
   // attr cache
@@ -3412,7 +3408,7 @@ inline ostream& operator<<(ostream& out, const ObjectState& obs)
   return out;
 }
 
-inline ostream& operator<<(ostream& out, const ObjectContext::RWState& rw)
+inline ostream& operator<<(ostream& out, const RWState& rw)
 {
   return out << "rwstate(" << rw.get_state_name()
 	     << " n=" << rw.count

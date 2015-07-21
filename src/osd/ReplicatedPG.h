@@ -266,6 +266,52 @@ public:
     return pgbackend.get();
   }
 
+  class C_OSD_CompletedRecoveredObject : public Context {
+    ReplicatedPGRef pg;
+    ObjectContextRef obc;
+    epoch_t epoch;
+
+  public:
+    C_OSD_CompletedRecoveredObject(
+      ReplicatedPGRef pg,
+      ObjectContextRef obc,
+      epoch_t epoch)
+      : pg(pg), obc(obc), epoch(epoch) {}
+
+    void finish(int) {
+      pg->lock();
+      if (pg->pg_has_reset_since(epoch)) {
+	pg->unlock();
+	return;
+      }
+      list<OpRequestRef> to_requeue;
+      obc->drop_recovery_excl_to_read(&to_requeue);
+      pg->requeue_ops(to_requeue);
+      pg->unlock();
+    }
+  };
+  friend class C_OSD_CompletedRecoveredObject;
+
+  class C_OSD_CompletedRecoveredObjectReplica : public Context {
+    ReplicatedPGRef pg;
+    RWStateRef lock;
+
+  public:
+    C_OSD_CompletedRecoveredObjectReplica(
+      ReplicatedPGRef pg,
+      RWStateRef lock)
+      : pg(pg), lock(lock) {}
+
+    void finish(int) {
+      pg->lock();
+      list<OpRequestRef> to_requeue;
+      lock->put_write(&to_requeue);
+      pg->requeue_ops(to_requeue);
+      pg->unlock();
+    }
+  };
+  friend class C_OSD_CompletedRecoveredObjectReplica;
+
   /// Listener methods
   void on_local_recover(
     const hobject_t &oid,
@@ -386,6 +432,12 @@ public:
     map<string, bufferlist> &attrs) {
     return get_object_context(hoid, true, &attrs);
   }
+
+  friend class C_PG_ReleaseReplicaWriteLocks;
+  void get_replica_write_locks(
+    const vector<pg_log_entry_t> &logv,
+    ObjectStore::Transaction *t);
+    
   void log_operation(
     const vector<pg_log_entry_t> &logv,
     boost::optional<pg_hit_set_history_t> &hset_history,
@@ -398,6 +450,8 @@ public:
       dirty_info = true;
     }
     append_log(logv, trim_to, trim_rollback_to, *t, transaction_applied);
+    if (!is_primary())
+      get_replica_write_locks(logv, t);
   }
 
   void op_applied(
@@ -516,7 +570,7 @@ public:
     };
     list<NotifyAck> notify_acks;
     
-    uint64_t bytes_written, bytes_read;
+    uint64_t bytes_written;
 
     utime_t mtime;
     SnapContext snapc;           // writer snap context
@@ -531,7 +585,6 @@ public:
 
     interval_set<uint64_t> modified_ranges;
     ObjectContextRef obc;
-    map<hobject_t,ObjectContextRef> src_obc;
     ObjectContextRef clone_obc;    // if we created a clone
     ObjectContextRef snapset_obc;  // if we created/deleted a snapdir
 
@@ -609,7 +662,7 @@ public:
       new_obs(obs->oi, obs->exists),
       modify(false), user_modify(false), undirty(false), cache_evict(false),
       ignore_cache(false), ignore_log_op_stats(false),
-      bytes_written(0), bytes_read(0), user_at_version(0),
+      bytes_written(0), user_at_version(0),
       current_osd_subop_num(0),
       op_t(NULL),
       obc(obc),
@@ -632,7 +685,7 @@ public:
       op(_op), reqid(_reqid), ops(_ops), obs(NULL), snapset(0),
       modify(false), user_modify(false), undirty(false), cache_evict(false),
       ignore_cache(false), ignore_log_op_stats(false),
-      bytes_written(0), bytes_read(0), user_at_version(0),
+      bytes_written(0), user_at_version(0),
       current_osd_subop_num(0),
       op_t(NULL),
       data_off(0), reply(NULL), pg(_pg),
@@ -686,7 +739,6 @@ public:
 
     OpContext *ctx;
     ObjectContextRef obc;
-    map<hobject_t,ObjectContextRef> src_obc;
 
     ceph_tid_t rep_tid;
 
@@ -752,16 +804,16 @@ protected:
      * this (read or write) if we get the first we will be guaranteed
      * to get the second.
      */
-    ObjectContext::RWState::State type = ObjectContext::RWState::RWNONE;
+    RWState::State type = RWState::RWNONE;
     if (write_ordered && ctx->op->may_read()) {
-      type = ObjectContext::RWState::RWEXCL;
+      type = RWState::RWEXCL;
       ctx->lock_to_release = OpContext::E_LOCK;
     } else if (write_ordered) {
-      type = ObjectContext::RWState::RWWRITE;
+      type = RWState::RWWRITE;
       ctx->lock_to_release = OpContext::W_LOCK;
     } else {
       assert(ctx->op->may_read());
-      type = ObjectContext::RWState::RWREAD;
+      type = RWState::RWREAD;
       ctx->lock_to_release = OpContext::R_LOCK;
     }
 
@@ -861,7 +913,7 @@ protected:
     assert(ctx->release_snapset_obc == false);
     ctx->lock_to_release = OpContext::NONE;
     if (requeue_recovery || requeue_recovery_clone || requeue_recovery_snapset)
-      osd->recovery_wq.queue(this);
+      queue_recovery();
     if (requeue_snaptrimmer ||
 	requeue_snaptrimmer_clone ||
 	requeue_snaptrimmer_snapset)
@@ -985,9 +1037,10 @@ protected:
 
   // projected object info
   SharedLRU<hobject_t, ObjectContext> object_contexts;
-  // map from oid.snapdir() to SnapSetContext *
-  map<hobject_t, SnapSetContext*> snapset_contexts;
-  Mutex snapset_contexts_lock;
+  SharedPtrRegistry<hobject_t, RWState> rwstate_registry;
+
+  // map from oid.snapdir() to SnapSetContextRef
+  SharedPtrRegistry<hobject_t, SnapSetContext> snapset_contexts;
 
   // debug order that client ops are applied
   map<hobject_t, map<client_t, ceph_tid_t> > debug_op_order;
@@ -1001,7 +1054,79 @@ public:
   void handle_watch_timeout(WatchRef watch);
 protected:
 
-  ObjectContextRef create_object_context(const object_info_t& oi, SnapSetContext *ssc);
+  /**
+   * get_object_snapset
+   *
+   * Fetches the snapset for soid from disk
+   *
+   * @param soid [in] object to get snapset for
+   * @param SnapSet [out] resulting object info 
+   * @param missing_oid [out] populated with the reason for EAGAIN return
+   * @param attr [in] optional, ssattr buffer to use instead of going to disk
+   * @return -ENOENT if no such object exists, -EAGAIN if an object is missing
+   */
+  int get_object_snapset(
+    const hobject_t &soid,
+    SnapSet *snapset,
+    hobject_t *missing_oid = NULL,
+    bufferlist *attr = NULL
+    );
+
+  /**
+   * get_object_info
+   *
+   * Fetches the object info off disk corresponding for soid.
+   * This method assumes that soid has already been resolved to a
+   * specific object and does not examine the SnapSet to map the
+   * snap to an object.
+   *
+   * @param soid [in] object to look up
+   * @param oi [out] resulting object info, may be null
+   * @param attr [in] OIATTR to use instead of looking at the disk
+   * @return -ENOENT if the object does not exist, -EAGAIN if missing
+   */
+  int get_object_info(
+    const hobject_t &soid,
+    object_info_t *oi,
+    bufferlist *attr = NULL
+    );
+
+  /**
+   * find_object_state
+   *
+   * Maps soid to a specific clone using the SnapSet and clone oi.snaps
+   * and returns the object_info.  Obtains read locks on relevant
+   * objects.
+   *
+   * @param soid [in] object to look up -- must not be SNAPDIR
+   * @param snapset [in] snapset for soid
+   * @param oi [out] object info if found, may be null
+   * @param map_snapid_to_clone [in] if true, treat the snap as the clone id
+   *        even if the snap has been removed (not present in oi.snaps)
+   * @param missing_oid [out] if non-null, will be filled in with the first
+   *        oid which caused an -EAGAIN return value.
+   * @param locks_to_drop [out] list of locks which need read locks dropped
+   * @return -ENOENT if the oid does not exist, -EAGAIN if a required object is
+   *         missing or if some lock was not available (in which case, none are
+   *         taken)
+   *
+   * A different return value may be necessary for the lock case if we want
+   * the replica to actually queue the request.  For now, returning -EAGAIN
+   * is fine.
+   */
+  int find_object_info_and_get_read_locks(
+    const hobject_t &soid,
+    object_info_t *oi,
+    list<RWStateRef> *locks_to_drop);
+
+
+  ObjectContextRef create_object_context(
+    const object_info_t& oi,
+    SnapSetContextRef ssc,
+    bool exists,
+    map<string, bufferlist> *attrs = 0
+    );
+
   ObjectContextRef get_object_context(
     const hobject_t& soid,
     bool can_create,
@@ -1030,25 +1155,11 @@ protected:
 
   void get_src_oloc(const object_t& oid, const object_locator_t& oloc, object_locator_t& src_oloc);
 
-  SnapSetContext *create_snapset_context(const hobject_t& oid);
-  SnapSetContext *get_snapset_context(
+  SnapSetContextRef get_snapset_context(
     const hobject_t& oid,
     bool can_create,
-    map<string, bufferlist> *attrs = 0
+    bufferlist *attr = 0
     );
-  void register_snapset_context(SnapSetContext *ssc) {
-    Mutex::Locker l(snapset_contexts_lock);
-    _register_snapset_context(ssc);
-  }
-  void _register_snapset_context(SnapSetContext *ssc) {
-    assert(snapset_contexts_lock.is_locked());
-    if (!ssc->registered) {
-      assert(snapset_contexts.count(ssc->oid) == 0);
-      ssc->registered = true;
-      snapset_contexts[ssc->oid] = ssc;
-    }
-  }
-  void put_snapset_context(SnapSetContext *ssc);
 
   map<hobject_t, ObjectContextRef> recovering;
 
@@ -1155,7 +1266,10 @@ protected:
   void reply_ctx(OpContext *ctx, int err);
   void reply_ctx(OpContext *ctx, int err, eversion_t v, version_t uv);
   void make_writeable(OpContext *ctx);
-  void log_op_stats(OpContext *ctx);
+  void log_op_stats(
+    OpRequestRef op,
+    uint64_t outb,
+    utime_t readable_stamp);
 
   void write_update_size_and_usage(object_stat_sum_t& stats, object_info_t& oi,
 				   interval_set<uint64_t>& modified, uint64_t offset,
@@ -1191,6 +1305,14 @@ protected:
   int prepare_transaction(OpContext *ctx);
   list<pair<OpRequestRef, OpContext*> > in_progress_async_reads;
   void complete_read_ctx(int result, OpContext *ctx);
+  void send_read_reply(
+    vector<OSDOp> &ops,
+    MOSDOp *m,
+    MOSDOpReply *reply,
+    int result,
+    int data_off,
+    eversion_t version,
+    version_t user_version);
   
   // pg on-disk content
   void check_local();
@@ -1199,19 +1321,19 @@ protected:
 
   void queue_for_recovery();
   bool start_recovery_ops(
-    int max, RecoveryCtx *prctx,
-    ThreadPool::TPHandle &handle, int *started);
+    uint64_t max, RecoveryCtx *prctx,
+    ThreadPool::TPHandle &handle, uint64_t *started);
 
-  int recover_primary(int max, ThreadPool::TPHandle &handle);
-  int recover_replicas(int max, ThreadPool::TPHandle &handle);
+  uint64_t recover_primary(uint64_t max, ThreadPool::TPHandle &handle);
+  uint64_t recover_replicas(uint64_t max, ThreadPool::TPHandle &handle);
   hobject_t earliest_peer_backfill() const;
   bool all_peer_done() const;
   /**
    * @param work_started will be set to true if recover_backfill got anywhere
    * @returns the number of operations started
    */
-  int recover_backfill(int max, ThreadPool::TPHandle &handle,
-                       bool *work_started);
+  uint64_t recover_backfill(uint64_t max, ThreadPool::TPHandle &handle,
+			    bool *work_started);
 
   /**
    * scan a (hash) range of objects in the current pg
@@ -1239,28 +1361,6 @@ protected:
   void send_remove_op(const hobject_t& oid, eversion_t v, pg_shard_t peer);
 
 
-  struct C_OSD_OndiskWriteUnlock : public Context {
-    ObjectContextRef obc, obc2, obc3;
-    C_OSD_OndiskWriteUnlock(
-      ObjectContextRef o,
-      ObjectContextRef o2 = ObjectContextRef(),
-      ObjectContextRef o3 = ObjectContextRef()) : obc(o), obc2(o2), obc3(o3) {}
-    void finish(int r) {
-      obc->ondisk_write_unlock();
-      if (obc2)
-	obc2->ondisk_write_unlock();
-      if (obc3)
-	obc3->ondisk_write_unlock();
-    }
-  };
-  struct C_OSD_OndiskWriteUnlockList : public Context {
-    list<ObjectContextRef> *pls;
-    C_OSD_OndiskWriteUnlockList(list<ObjectContextRef> *l) : pls(l) {}
-    void finish(int r) {
-      for (list<ObjectContextRef>::iterator p = pls->begin(); p != pls->end(); ++p)
-	(*p)->ondisk_write_unlock();
-    }
-  };
   struct C_OSD_AppliedRecoveredObject : public Context {
     ReplicatedPGRef pg;
     ObjectContextRef obc;
@@ -1407,6 +1507,7 @@ public:
     OpRequestRef& op,
     ThreadPool::TPHandle &handle);
   void do_op(OpRequestRef& op);
+  void do_op_replica(OpRequestRef &op);
   bool pg_op_must_wait(MOSDOp *op);
   void do_pg_op(OpRequestRef op);
   void do_sub_op(OpRequestRef op);
@@ -1418,6 +1519,18 @@ public:
 
   RepGather *trim_object(const hobject_t &coid);
   void snap_trimmer(epoch_t e);
+
+  int do_replica_safe_read(
+    OSDOp &osd_op,
+    const object_info_t &oi,
+    object_stat_sum_t &delta_stats,
+    bool &first_read,
+    int &data_off,
+    int &num_read,
+    list<pair<boost::tuple<uint64_t, uint64_t, unsigned>,
+         pair<bufferlist*, Context*> > > *pending_async_reads, // null on replica
+    ObjectContextRef obc // null on replica
+    );
   int do_osd_ops(OpContext *ctx, vector<OSDOp>& ops);
 
   int _get_tmap(OpContext *ctx, bufferlist *header, bufferlist *vals);
@@ -1559,10 +1672,12 @@ public:
     PGBackend::PGTransaction *t,
     const string &key);
   int getattr_maybe_cache(
+    const hobject_t &soid,
     ObjectContextRef obc,
     const string &key,
     bufferlist *val);
   int getattrs_maybe_cache(
+    const hobject_t &soid,
     ObjectContextRef obc,
     map<string, bufferlist> *out,
     bool user_only = false);

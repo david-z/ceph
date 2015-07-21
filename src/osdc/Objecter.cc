@@ -2077,7 +2077,6 @@ void Objecter::_send_op_account(Op *op)
     case CEPH_OSD_OP_DELETE: code = l_osdc_osdop_delete; break;
     case CEPH_OSD_OP_MAPEXT: code = l_osdc_osdop_mapext; break;
     case CEPH_OSD_OP_SPARSE_READ: code = l_osdc_osdop_sparse_read; break;
-    case CEPH_OSD_OP_CLONERANGE: code = l_osdc_osdop_clonerange; break;
     case CEPH_OSD_OP_GETXATTR: code = l_osdc_osdop_getxattr; break;
     case CEPH_OSD_OP_SETXATTR: code = l_osdc_osdop_setxattr; break;
     case CEPH_OSD_OP_CMPXATTR: code = l_osdc_osdop_cmpxattr; break;
@@ -2105,7 +2104,6 @@ void Objecter::_send_op_account(Op *op)
     case CEPH_OSD_OP_CALL: code = l_osdc_osdop_call; break;
     case CEPH_OSD_OP_WATCH: code = l_osdc_osdop_watch; break;
     case CEPH_OSD_OP_NOTIFY: code = l_osdc_osdop_notify; break;
-    case CEPH_OSD_OP_SRC_CMPXATTR: code = l_osdc_osdop_src_cmpxattr; break;
     }
     if (code)
       logger->inc(code);
@@ -2512,7 +2510,10 @@ int Objecter::_calc_target(op_target_t *t, epoch_t *last_force_resend,  bool any
       is_pg_changed(
 	t->acting_primary, t->acting, acting_primary, acting,
 	t->used_replica || any_change) ||
-      force_resend) {
+      force_resend ||
+      (t->used_replica &&
+       ~((t->flags &
+	  (CEPH_OSD_FLAG_BALANCE_READS | CEPH_OSD_FLAG_LOCALIZE_READS))))) {
     t->pgid = pgid;
     t->acting = acting;
     t->acting_primary = acting_primary;
@@ -2964,8 +2965,8 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
 
   int rc = m->get_result();
 
-  if (m->is_redirect_reply()) {
-    ldout(cct, 5) << " got redirect reply; redirecting" << dendl;
+  if (m->is_redirect_reply() || rc == -EAGAIN) {
+    ldout(cct, 5) << " got redirect reply or EAGAIN; redirecting" << dendl;
     if (op->onack)
       num_unacked.dec();
     if (op->oncommit || op->oncommit_sync)
@@ -2977,24 +2978,22 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
     // FIXME: two redirects could race and reorder
 
     op->tid = 0;
-    m->get_redirect().combine_with_locator(op->target.target_oloc,
-					   op->target.target_oid.name);
-    op->target.flags |= CEPH_OSD_FLAG_REDIRECTED;
+    if (m->is_redirect_reply()) {
+      ldout(cct, 5) << " got redirect reply, updating locator and flags"
+		    << dendl;
+      m->get_redirect().combine_with_locator(op->target.target_oloc,
+					     op->target.target_oid.name);
+      op->target.flags |= CEPH_OSD_FLAG_REDIRECTED;
+    } else {
+      assert(rc == -EAGAIN);
+      ldout(cct, 5) << " got EAGAIN reply, removing BALANCE_READS and"
+		    << " resending"
+		    << dendl;
+      op->target.flags &= ~(
+	CEPH_OSD_FLAG_BALANCE_READS|
+	CEPH_OSD_FLAG_LOCALIZE_READS);
+    }
     _op_submit(op, lc);
-    m->put();
-    return;
-  }
-
-  if (rc == -EAGAIN) {
-    ldout(cct, 7) << " got -EAGAIN, resubmitting" << dendl;
-
-    // new tid
-    s->ops.erase(op->tid);
-    op->tid = last_tid.inc();
-
-    _send_op(op);
-    s->lock.unlock();
-    put_session(s);
     m->put();
     return;
   }
