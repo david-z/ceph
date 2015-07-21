@@ -147,7 +147,7 @@ private:
   snap_t m_snap_seq;
   SnapContext m_snapc;
   atomic_t m_refcount;
-
+  atomic_t m_pending_ops;
 };
 
 } // namespace librados
