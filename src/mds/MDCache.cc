@@ -298,7 +298,8 @@ void MDCache::remove_inode(CInode *o)
 
   o->item_open_file.remove_myself();
 
-  export_pin_queue.erase(o);
+  if (o->state_test(CInode::STATE_QUEUEDEXPORTPIN))
+    export_pin_queue.erase(o);
 
   // remove from inode map
   inode_map.erase(o->vino());    
@@ -10754,7 +10755,6 @@ void MDCache::adjust_dir_fragments(CInode *diri,
     // merge
     CDir *f = new CDir(diri, basefrag, this, srcfrags.front()->is_auth());
     f->merge(srcfrags, waiters, replay);
-    diri->add_dirfrag(f);
 
     if (was_subtree) {
       assert(f->is_subtree_root());
